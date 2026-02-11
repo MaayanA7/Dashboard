@@ -14,6 +14,10 @@ export default defineConfig({
         target: "http://127.0.0.1:5174",
         changeOrigin: true,
       },
+      "/api/notes": {
+        target: "http://127.0.0.1:5174",
+        changeOrigin: true,
+      },
     },
   },
 });

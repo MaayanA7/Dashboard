@@ -108,6 +108,36 @@ function classNames(...parts) {
   return parts.filter(Boolean).join(" ");
 }
 
+function getInitials(name) {
+  if (!name) return "NA";
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 1) {
+    return parts[0].slice(0, 2).toUpperCase();
+  }
+  return `${parts[0][0]}${parts[1][0]}`.toUpperCase();
+}
+
+function parseSummaryChecklist(text) {
+  const lines = (text || "").split("\n");
+  const checklist = [];
+  const summaryLines = [];
+  lines.forEach((line) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("*")) {
+      const item = trimmed.replace(/^\*\s*/, "").trim();
+      if (item) {
+        checklist.push({ text: item, done: false });
+      }
+    } else {
+      summaryLines.push(line);
+    }
+  });
+  return {
+    summary: summaryLines.join("\n").trim(),
+    checklist,
+  };
+}
+
 export default function App() {
   const [tasks, setTasks] = useState([]);
   const [view, setView] = useState("board");
@@ -123,6 +153,23 @@ export default function App() {
   const [draggingId, setDraggingId] = useState(null);
   const [formOpen, setFormOpen] = useState(false);
   const [detailTask, setDetailTask] = useState(null);
+  const [detailEdit, setDetailEdit] = useState(false);
+  const [detailDraft, setDetailDraft] = useState(null);
+  const [notifyStatus, setNotifyStatus] = useState({ status: "idle", message: "" });
+  const [notes, setNotes] = useState([]);
+  const [notesError, setNotesError] = useState("");
+  const [noteFormOpen, setNoteFormOpen] = useState(false);
+  const [noteEditOpen, setNoteEditOpen] = useState(false);
+  const [noteDraft, setNoteDraft] = useState(null);
+  const [draggingNoteId, setDraggingNoteId] = useState(null);
+  const [dragOverNoteId, setDragOverNoteId] = useState(null);
+  const [monitorRange, setMonitorRange] = useState("day");
+  const [newNote, setNewNote] = useState({
+    title: "",
+    body: "",
+    tags: "",
+    color: "midnight",
+  });
   const [aiOpen, setAiOpen] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [aiError, setAiError] = useState("");
@@ -131,6 +178,7 @@ export default function App() {
   const [aiChatInput, setAiChatInput] = useState("");
   const [aiChat, setAiChat] = useState([]);
   const [aiTab, setAiTab] = useState("summary");
+  const [now, setNow] = useState(() => new Date());
   const [newTask, setNewTask] = useState({
     title: "",
     summary: "",
@@ -144,6 +192,8 @@ export default function App() {
     repeatInterval: 1,
     repeatUnit: "weeks",
     repeatEndDate: "",
+    notify: false,
+    reminder_time: "",
   });
 
   const AI_BASE_URL = import.meta.env.VITE_AI_BASE_URL || "/api/ai/v1";
@@ -173,6 +223,38 @@ export default function App() {
     return { total, done, critical, dueSoon };
   }, [tasks]);
 
+  const monitorStats = useMemo(() => {
+    const nowDate = new Date();
+    const start = new Date(nowDate);
+    if (monitorRange === "day") {
+      start.setHours(0, 0, 0, 0);
+    } else if (monitorRange === "week") {
+      const day = (start.getDay() + 6) % 7;
+      start.setDate(start.getDate() - day);
+      start.setHours(0, 0, 0, 0);
+    } else if (monitorRange === "month") {
+      start.setDate(1);
+      start.setHours(0, 0, 0, 0);
+    } else {
+      start.setMonth(0, 1);
+      start.setHours(0, 0, 0, 0);
+    }
+    const created = tasks.filter((task) => {
+      if (!task.createdAt) return false;
+      return new Date(task.createdAt) >= start;
+    }).length;
+    const completed = tasks.filter((task) => {
+      if (!task.completedAt) return false;
+      return new Date(task.completedAt) >= start;
+    }).length;
+    const active = tasks.filter((task) => task.status !== "done").length;
+    const overdue = tasks.filter((task) => {
+      if (!task.due) return false;
+      return task.status !== "done" && new Date(task.due) < nowDate;
+    }).length;
+    return { created, completed, active, overdue };
+  }, [tasks, monitorRange]);
+
   function handleDrop(status) {
     if (!draggingId) return;
     setTasks((prev) =>
@@ -189,6 +271,7 @@ export default function App() {
   }
 
   function handleStatusChange(taskId, status) {
+    const completedAt = status === "done" ? new Date().toISOString() : null;
     setTasks((prev) =>
       prev.map((task) =>
         task.id === taskId
@@ -196,6 +279,7 @@ export default function App() {
               ...task,
               status,
               repeat: status === "done" ? null : task.repeat,
+              completedAt,
             }
           : task
       )
@@ -206,6 +290,7 @@ export default function App() {
       body: JSON.stringify({
         status,
         repeat: status === "done" ? null : undefined,
+        completedAt,
       }),
     }).catch(() => {});
   }
@@ -214,10 +299,11 @@ export default function App() {
     e.preventDefault();
     if (!newTask.title.trim()) return;
     const id = `tsk-${Date.now()}`;
+    const parsed = parseSummaryChecklist(newTask.summary);
     const task = {
       id,
       title: newTask.title.trim(),
-      summary: newTask.summary.trim() || "No summary yet",
+      summary: parsed.summary || "No summary yet",
       status: newTask.status,
       priority: newTask.priority,
       due: newTask.due || "2026-02-20",
@@ -227,6 +313,8 @@ export default function App() {
       tags: newTask.tags
         ? newTask.tags.split(",").map((tag) => tag.trim()).filter(Boolean)
         : [],
+      createdAt: new Date().toISOString(),
+      completedAt: newTask.status === "done" ? new Date().toISOString() : null,
       repeat: newTask.repeatEnabled
         ? {
             interval: Number(newTask.repeatInterval) || 1,
@@ -234,6 +322,9 @@ export default function App() {
             endDate: newTask.repeatEndDate || null,
           }
         : null,
+      notify: newTask.notify,
+      reminder_time: newTask.reminder_time || null,
+      checklist: parsed.checklist,
     };
     setTasks((prev) => [task, ...prev]);
     fetch("/api/tasks", {
@@ -255,21 +346,119 @@ export default function App() {
       repeatInterval: 1,
       repeatUnit: "weeks",
       repeatEndDate: "",
+      notify: false,
+      reminder_time: "",
     });
   }
 
   function openTask(task) {
     setDetailTask(task);
+    setDetailEdit(false);
+    setDetailDraft({
+      ...task,
+      tags: task.tags.join(", "),
+      summary: [
+        task.summary,
+        ...(task.checklist || []).map((item) => `* ${item.text}`),
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      repeatEnabled: !!task.repeat,
+      repeatInterval: task.repeat?.interval ?? 1,
+      repeatUnit: task.repeat?.unit ?? "weeks",
+      repeatEndDate: task.repeat?.endDate ?? "",
+    });
+    setNotifyStatus({ status: "idle", message: "" });
   }
 
   function closeTask() {
     setDetailTask(null);
+    setDetailEdit(false);
+    setDetailDraft(null);
+    setNotifyStatus({ status: "idle", message: "" });
   }
 
   function deleteTask(taskId) {
     setTasks((prev) => prev.filter((task) => task.id !== taskId));
     setDetailTask((prev) => (prev?.id === taskId ? null : prev));
     fetch(`/api/tasks/${taskId}`, { method: "DELETE" }).catch(() => {});
+  }
+
+  function saveTaskEdits() {
+    if (!detailDraft || !detailTask) return;
+    const parsed = parseSummaryChecklist(detailDraft.summary);
+    const updates = {
+      title: detailDraft.title?.trim() || detailTask.title,
+      summary: parsed.summary || detailTask.summary,
+      status: detailDraft.status || detailTask.status,
+      priority: detailDraft.priority || detailTask.priority,
+      due: detailDraft.due || detailTask.due,
+      assignee: detailDraft.assignee?.trim() || detailTask.assignee,
+      project: detailDraft.project?.trim() || detailTask.project,
+      tags: detailDraft.tags
+        ? detailDraft.tags.split(",").map((t) => t.trim()).filter(Boolean)
+        : [],
+      notify: !!detailDraft.notify,
+      reminder_time: detailDraft.reminder_time || null,
+      repeat: detailDraft.repeatEnabled
+        ? {
+            interval: Number(detailDraft.repeatInterval) || 1,
+            unit: detailDraft.repeatUnit || "weeks",
+            endDate: detailDraft.repeatEndDate || null,
+          }
+        : null,
+      checklist: parsed.checklist.length ? parsed.checklist : detailTask.checklist,
+    };
+    setTasks((prev) =>
+      prev.map((task) => (task.id === detailTask.id ? { ...task, ...updates } : task))
+    );
+    setDetailTask((prev) => (prev ? { ...prev, ...updates } : prev));
+    fetch(`/api/tasks/${detailTask.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    }).catch(() => {});
+    setDetailEdit(false);
+  }
+
+  async function sendWhatsApp(taskId) {
+    setNotifyStatus({ status: "loading", message: "" });
+    try {
+      const response = await fetch(`/api/tasks/${taskId}/notify`, { method: "POST" });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Failed to send WhatsApp");
+      }
+      setNotifyStatus({ status: "success", message: "Sent." });
+    } catch (error) {
+      setNotifyStatus({ status: "error", message: error.message });
+    }
+  }
+
+  function toggleChecklistItem(taskId, index) {
+    setTasks((prev) =>
+      prev.map((task) => {
+        if (task.id !== taskId) return task;
+        const nextChecklist = (task.checklist || []).map((item, idx) =>
+          idx === index ? { ...item, done: !item.done } : item
+        );
+        fetch(`/api/tasks/${taskId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ checklist: nextChecklist }),
+        }).catch(() => {});
+        return { ...task, checklist: nextChecklist };
+      })
+    );
+    if (detailTask?.id === taskId) {
+      setDetailTask((prev) => {
+        if (!prev) return prev;
+        const nextChecklist = (prev.checklist || []).map((item, idx) =>
+          idx === index ? { ...item, done: !item.done } : item
+        );
+        return { ...prev, checklist: nextChecklist };
+      });
+    }
   }
 
   function taskContext() {
@@ -553,6 +742,11 @@ export default function App() {
       }
       if (nextDue.getTime() !== dueDate.getTime()) {
         changed = true;
+        fetch(`/api/tasks/${task.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ due: formatDate(nextDue) }),
+        }).catch(() => {});
         return { ...task, due: formatDate(nextDue) };
       }
       return task;
@@ -582,18 +776,234 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  function saveNotesLocal(nextNotes) {
+    try {
+      window.localStorage.setItem("notes-cache", JSON.stringify(nextNotes));
+    } catch (error) {
+      // ignore
+    }
+  }
+
+  function loadNotesLocal() {
+    try {
+      const cached = window.localStorage.getItem("notes-cache");
+      return cached ? JSON.parse(cached) : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  useEffect(() => {
+    async function loadNotes() {
+      try {
+        const response = await fetch("/api/notes");
+        if (!response.ok) throw new Error("Failed to load notes");
+        const data = await response.json();
+        setNotes(data);
+        saveNotesLocal(data);
+        setNotesError("");
+      } catch (error) {
+        const localNotes = loadNotesLocal();
+        setNotes(localNotes);
+        setNotesError("Notes API offline. Showing local cache.");
+      }
+    }
+    loadNotes();
+  }, []);
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setNow(new Date());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
   useEffect(() => {
     if (typeof window === "undefined") return;
     window.localStorage.setItem("dashboard-theme", theme);
   }, [theme]);
 
-  const navItems = [
-    "Overview",
-    "My Tasks",
-    "Roadmap",
-    "Insights",
-    "Settings",
-  ];
+  const navItems = ["Overview", "Notes", "Monitor"];
+
+  function formatDateKey(date) {
+    return date.toISOString().slice(0, 10);
+  }
+
+  function startOfDay(date) {
+    const d = new Date(date);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  function addDays(date, days) {
+    const d = new Date(date);
+    d.setDate(d.getDate() + days);
+    return d;
+  }
+
+  function getBuckets(range) {
+    const nowDate = new Date();
+    if (range === "day") {
+      const start = startOfDay(addDays(nowDate, -6));
+      return Array.from({ length: 7 }, (_, i) => addDays(start, i));
+    }
+    if (range === "week") {
+      const buckets = [];
+      const start = startOfDay(addDays(nowDate, -7 * 7));
+      for (let i = 0; i < 8; i += 1) {
+        buckets.push(addDays(start, i * 7));
+      }
+      return buckets;
+    }
+    if (range === "month") {
+      const buckets = [];
+      const start = new Date(nowDate.getFullYear(), nowDate.getMonth() - 11, 1);
+      for (let i = 0; i < 12; i += 1) {
+        buckets.push(new Date(start.getFullYear(), start.getMonth() + i, 1));
+      }
+      return buckets;
+    }
+    const buckets = [];
+    const start = new Date(nowDate.getFullYear() - 4, 0, 1);
+    for (let i = 0; i < 5; i += 1) {
+      buckets.push(new Date(start.getFullYear() + i, 0, 1));
+    }
+    return buckets;
+  }
+
+  function bucketLabel(range, date) {
+    if (range === "day") return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    if (range === "week") return `Wk ${Math.ceil(date.getDate() / 7)} ${date.toLocaleDateString(undefined, { month: "short" })}`;
+    if (range === "month") return date.toLocaleDateString(undefined, { month: "short" });
+    return date.getFullYear().toString();
+  }
+
+  function computeSeries(range) {
+    const buckets = getBuckets(range);
+    const created = buckets.map(() => 0);
+    const completed = buckets.map(() => 0);
+    const overdue = buckets.map(() => 0);
+    const bucketEnds = buckets.map((bucket, index) => {
+      if (range === "day") return addDays(bucket, 1);
+      if (range === "week") return addDays(bucket, 7);
+      if (range === "month") return new Date(bucket.getFullYear(), bucket.getMonth() + 1, 1);
+      return new Date(bucket.getFullYear() + 1, 0, 1);
+    });
+
+    tasks.forEach((task) => {
+      const createdAt = task.createdAt ? new Date(task.createdAt) : null;
+      const completedAt = task.completedAt ? new Date(task.completedAt) : null;
+      buckets.forEach((bucket, index) => {
+        const end = bucketEnds[index];
+        if (createdAt && createdAt >= bucket && createdAt < end) created[index] += 1;
+        if (completedAt && completedAt >= bucket && completedAt < end) completed[index] += 1;
+      });
+    });
+
+    buckets.forEach((bucket, index) => {
+      const end = bucketEnds[index];
+      overdue[index] = tasks.filter((task) => {
+        if (!task.due) return false;
+        const dueDate = new Date(task.due);
+        const completedAt = task.completedAt ? new Date(task.completedAt) : null;
+        return dueDate < end && (!completedAt || completedAt >= end);
+      }).length;
+    });
+
+    return { buckets, created, completed, overdue };
+  }
+
+  function handleCreateNote(e) {
+    e.preventDefault();
+    if (!newNote.title.trim()) return;
+    const nextIndex = notes.length;
+    const note = {
+      id: `note-${Date.now()}`,
+      title: newNote.title.trim(),
+      body: newNote.body.trim(),
+      tags: newNote.tags
+        ? newNote.tags.split(",").map((t) => t.trim()).filter(Boolean)
+        : [],
+      color: newNote.color,
+      createdAt: new Date().toISOString(),
+      orderIndex: nextIndex,
+    };
+    setNotes((prev) => [note, ...prev]);
+    saveNotesLocal([note, ...notes]);
+    fetch("/api/notes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(note),
+    }).catch(() => {
+      setNotesError("Notes API offline. Saved locally.");
+    });
+    setNoteFormOpen(false);
+    setNewNote({ title: "", body: "", tags: "", color: "midnight" });
+  }
+
+  function openNote(note) {
+    setNoteDraft({ ...note, tags: note.tags.join(", ") });
+    setNoteEditOpen(true);
+  }
+
+  function saveNoteEdits(e) {
+    e.preventDefault();
+    if (!noteDraft) return;
+    const updates = {
+      ...noteDraft,
+      title: noteDraft.title.trim() || "Untitled",
+      body: noteDraft.body?.trim() || "",
+      tags: noteDraft.tags
+        ? noteDraft.tags.split(",").map((t) => t.trim()).filter(Boolean)
+        : [],
+    };
+    setNotes((prev) =>
+      prev.map((note) => (note.id === updates.id ? updates : note))
+    );
+    saveNotesLocal(
+      notes.map((note) => (note.id === updates.id ? updates : note))
+    );
+    fetch(`/api/notes/${updates.id}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    }).catch(() => {
+      setNotesError("Notes API offline. Saved locally.");
+    });
+    setNoteEditOpen(false);
+    setNoteDraft(null);
+  }
+
+  function moveNote(targetId) {
+    if (!draggingNoteId || draggingNoteId === targetId) return;
+    setNotes((prev) => {
+      const currentIndex = prev.findIndex((note) => note.id === draggingNoteId);
+      const targetIndex = prev.findIndex((note) => note.id === targetId);
+      if (currentIndex === -1 || targetIndex === -1) return prev;
+      const next = [...prev];
+      const temp = next[currentIndex];
+      next[currentIndex] = next[targetIndex];
+      next[targetIndex] = temp;
+      saveNotesLocal(next);
+      fetch(`/api/notes/${next[currentIndex].id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderIndex: currentIndex }),
+      }).catch(() => {
+        setNotesError("Notes API offline. Saved locally.");
+      });
+      fetch(`/api/notes/${next[targetIndex].id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ orderIndex: targetIndex }),
+      }).catch(() => {
+        setNotesError("Notes API offline. Saved locally.");
+      });
+      return next;
+    });
+    setDraggingNoteId(null);
+    setDragOverNoteId(null);
+  }
 
   return (
     <div
@@ -604,15 +1014,15 @@ export default function App() {
       )}
     >
       <aside className={classNames("sidebar", !sidebarOpen && "collapsed")}>
-        <div className="logo-row">
-          <div className="logo">TaskFlow</div>
-          <button
-            className="icon-btn"
+          <div className="logo-row">
+            <div className="logo">TaskFlow</div>
+            <button
+            className="icon-btn panel-icon"
             onClick={() => setSidebarOpen(false)}
             aria-label="Hide sidebar"
             type="button"
           >
-            ◀
+            <span className="panel-glyph">▮▯</span>
           </button>
         </div>
         <nav className="nav">
@@ -631,10 +1041,44 @@ export default function App() {
           ))}
         </nav>
         <div className="sidebar-footer">
-          <div className="team-card">
-            <div className="team-card__title">Team Pulse</div>
-            <p>3 blockers need attention today.</p>
-            <button className="ghost-btn">Resolve blockers</button>
+          <div className="team-card clock-card">
+            <div className="team-card__title">Matrix</div>
+            <div className="clock">
+              <div className="clock-face" />
+              <div
+                className="hand hour"
+                style={{
+                  transform: `translate(-50%, -100%) rotate(${
+                    ((now.getHours() % 12) + now.getMinutes() / 60) * 30
+                  }deg)`,
+                }}
+              />
+              <div
+                className="hand minute"
+                style={{
+                  transform: `translate(-50%, -100%) rotate(${
+                    (now.getMinutes() + now.getSeconds() / 60) * 6
+                  }deg)`,
+                }}
+              />
+              <div
+                className="hand second"
+                style={{
+                  transform: `translate(-50%, -100%) rotate(${
+                    now.getSeconds() * 6
+                  }deg)`,
+                }}
+              />
+              <div className="clock-center" />
+            </div>
+            <div className="clock-date">
+              {now.toLocaleDateString(undefined, {
+                weekday: "short",
+                month: "short",
+                day: "numeric",
+                year: "numeric",
+              })}
+            </div>
           </div>
         </div>
       </aside>
@@ -642,19 +1086,18 @@ export default function App() {
       <main className="main">
         <header className="topbar">
           <div>
-            <p className="eyebrow">RDT Group - Success Board</p>
-            <h1>Product Ops Dashboard</h1>
+            <p className="eyebrow">RDT Group - Success Visions</p>
+            <h1>Board</h1>
             <div className="section-pill">{activeSection}</div>
           </div>
           <div className="topbar-actions">
             {!sidebarOpen && (
               <button
-                className="icon-btn light panel-toggle"
+                className="icon-btn light panel-icon"
                 onClick={() => setSidebarOpen(true)}
                 type="button"
               >
-                Panel
-                <span className="panel-arrow">▶</span>
+                <span className="panel-glyph">▮▯</span>
               </button>
             )}
             <button
@@ -667,14 +1110,29 @@ export default function App() {
               {theme === "dark" ? "Light mode" : "Dark mode"}
             </button>
             <div className="pill">
-              <span className="mono">FEB 09, 2026</span>
+              <span className="mono">
+                {now
+                  .toLocaleDateString(undefined, {
+                    month: "short",
+                    day: "2-digit",
+                    year: "numeric",
+                  })
+                  .toUpperCase()}
+              </span>
             </div>
-            <button className="primary-btn" onClick={() => setFormOpen(true)}>
-              + New task
-            </button>
             <button className="ghost-btn" onClick={() => setAiOpen(true)}>
               AI
             </button>
+            {activeSection === "Overview" && (
+              <button className="primary-btn" onClick={() => setFormOpen(true)}>
+                + New task
+              </button>
+            )}
+            {activeSection === "Notes" && (
+              <button className="primary-btn" onClick={() => setNoteFormOpen(true)}>
+                + New note
+              </button>
+            )}
           </div>
         </header>
 
@@ -691,7 +1149,9 @@ export default function App() {
           </section>
         )}
 
-        {activeSection !== "Overview" && (
+        {activeSection !== "Overview" &&
+          activeSection !== "Notes" &&
+          activeSection !== "Monitor" && (
           <section className="section-banner">
             <div>
               <h2>{activeSection}</h2>
@@ -703,6 +1163,98 @@ export default function App() {
             <button className="primary-btn" onClick={() => setFormOpen(true)}>
               Add widget
             </button>
+          </section>
+        )}
+
+        {activeSection === "Notes" && (
+          <section className="notes-board">
+            {notesError && <div className="notes-error">{notesError}</div>}
+            {notes.length === 0 ? (
+              <div className="notes-empty">
+                No notes yet. Create your first note.
+              </div>
+            ) : (
+              <div className="notes-grid">
+                {notes.map((note) => (
+                  <article
+                    key={note.id}
+                    className={`note-card ${note.color} ${
+                      dragOverNoteId === note.id ? "drag-over" : ""
+                    }`}
+                    draggable
+                    onDragStart={() => setDraggingNoteId(note.id)}
+                    onDragEnd={() => setDraggingNoteId(null)}
+                    onDragOver={(event) => {
+                      event.preventDefault();
+                      setDragOverNoteId(note.id);
+                    }}
+                    onDrop={() => moveNote(note.id)}
+                    onClick={() => openNote(note)}
+                  >
+                    <h4>{note.title}</h4>
+                    <p>{note.body || "No content yet."}</p>
+                    {note.tags.length > 0 && (
+                      <div className="card-tags">
+                        {note.tags.map((tag) => (
+                          <span key={tag} className="tag">
+                            {tag}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <div className="note-meta">
+                      {new Date(note.createdAt).toLocaleDateString()}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {activeSection === "Monitor" && (
+          <section className="monitor-section">
+            <div className="monitor-header">
+              <div className="monitor-tabs">
+                {[
+                  { id: "day", label: "Daily" },
+                  { id: "week", label: "Weekly" },
+                  { id: "month", label: "Monthly" },
+                  { id: "year", label: "Yearly" },
+                ].map((item) => (
+                  <button
+                    key={item.id}
+                    className={classNames(
+                      "monitor-tab",
+                      monitorRange === item.id && "active"
+                    )}
+                    onClick={() => setMonitorRange(item.id)}
+                    type="button"
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="monitor-metrics">
+              <div>
+                <span>Created</span>
+                <strong>{monitorStats.created}</strong>
+              </div>
+              <div>
+                <span>Completed</span>
+                <strong>{monitorStats.completed}</strong>
+              </div>
+              <div>
+                <span>Active</span>
+                <strong>{monitorStats.active}</strong>
+              </div>
+              <div>
+                <span>Overdue</span>
+                <strong>{monitorStats.overdue}</strong>
+              </div>
+            </div>
+            <MonitorCharts range={monitorRange} series={computeSeries(monitorRange)} tasks={tasks} />
           </section>
         )}
 
@@ -811,8 +1363,15 @@ export default function App() {
                                 />
                               </div>
                               <div className="meta">
-                                <span className="mono">Due {task.due}</span>
-                                <span className="avatar">{task.assignee}</span>
+                                <span className="meta-left">
+                                  {task.repeat && (
+                                    <span className="repeat-pill">Repeat</span>
+                                  )}
+                                  <span className="mono">Due {task.due}</span>
+                                </span>
+                                <span className="avatar">
+                                  {getInitials(task.assignee)}
+                                </span>
                               </div>
                             </div>
                           </article>
@@ -920,7 +1479,7 @@ export default function App() {
                       summary: event.target.value,
                     }))
                   }
-                  placeholder="What needs to happen?"
+                  placeholder="What needs to happen? Use * for checklist items"
                 />
               </label>
               <div className="grid">
@@ -1017,6 +1576,34 @@ export default function App() {
                 <label className="repeat-toggle">
                   <input
                     type="checkbox"
+                    checked={newTask.notify}
+                    onChange={(event) =>
+                      setNewTask((prev) => ({
+                        ...prev,
+                        notify: event.target.checked,
+                      }))
+                    }
+                  />
+                  Send WhatsApp notification
+                </label>
+                {newTask.notify && (
+                  <label>
+                    Reminder time
+                    <input
+                      type="time"
+                      value={newTask.reminder_time}
+                      onChange={(event) =>
+                        setNewTask((prev) => ({
+                          ...prev,
+                          reminder_time: event.target.value,
+                        }))
+                      }
+                    />
+                  </label>
+                )}
+                <label className="repeat-toggle">
+                  <input
+                    type="checkbox"
                     checked={newTask.repeatEnabled}
                     onChange={(event) =>
                       setNewTask((prev) => ({
@@ -1088,6 +1675,142 @@ export default function App() {
         </div>
       )}
 
+      {noteFormOpen && (
+        <div className="modal-backdrop" onClick={() => setNoteFormOpen(false)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Create new note</h2>
+              <button className="ghost-btn" onClick={() => setNoteFormOpen(false)}>
+                Close
+              </button>
+            </div>
+            <form className="modal-form" onSubmit={handleCreateNote}>
+              <label>
+                Title
+                <input
+                  value={newNote.title}
+                  onChange={(event) =>
+                    setNewNote((prev) => ({ ...prev, title: event.target.value }))
+                  }
+                  placeholder="Note title"
+                  required
+                />
+              </label>
+              <label>
+                Content
+                <textarea
+                  value={newNote.body}
+                  onChange={(event) =>
+                    setNewNote((prev) => ({ ...prev, body: event.target.value }))
+                  }
+                  placeholder="Write your note..."
+                />
+              </label>
+              <div className="grid">
+                <label>
+                  Tags (comma separated)
+                  <input
+                    value={newNote.tags}
+                    onChange={(event) =>
+                      setNewNote((prev) => ({ ...prev, tags: event.target.value }))
+                    }
+                    placeholder="ideas, research"
+                  />
+                </label>
+                <label>
+                  Color
+                  <select
+                    value={newNote.color}
+                    onChange={(event) =>
+                      setNewNote((prev) => ({ ...prev, color: event.target.value }))
+                    }
+                  >
+                    <option value="midnight">Midnight</option>
+                    <option value="indigo">Indigo</option>
+                    <option value="teal">Teal</option>
+                    <option value="sunset">Sunset</option>
+                  </select>
+                </label>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="ghost-btn" onClick={() => setNoteFormOpen(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="primary-btn">
+                  Create note
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {noteEditOpen && noteDraft && (
+        <div className="modal-backdrop" onClick={() => setNoteEditOpen(false)}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Edit note</h2>
+              <button className="ghost-btn" onClick={() => setNoteEditOpen(false)}>
+                Close
+              </button>
+            </div>
+            <form className="modal-form" onSubmit={saveNoteEdits}>
+              <label>
+                Title
+                <input
+                  value={noteDraft.title}
+                  onChange={(event) =>
+                    setNoteDraft((prev) => ({ ...prev, title: event.target.value }))
+                  }
+                />
+              </label>
+              <label>
+                Content
+                <textarea
+                  value={noteDraft.body}
+                  onChange={(event) =>
+                    setNoteDraft((prev) => ({ ...prev, body: event.target.value }))
+                  }
+                />
+              </label>
+              <div className="grid">
+                <label>
+                  Tags (comma separated)
+                  <input
+                    value={noteDraft.tags}
+                    onChange={(event) =>
+                      setNoteDraft((prev) => ({ ...prev, tags: event.target.value }))
+                    }
+                  />
+                </label>
+                <label>
+                  Color
+                  <select
+                    value={noteDraft.color}
+                    onChange={(event) =>
+                      setNoteDraft((prev) => ({ ...prev, color: event.target.value }))
+                    }
+                  >
+                    <option value="midnight">Midnight</option>
+                    <option value="indigo">Indigo</option>
+                    <option value="teal">Teal</option>
+                    <option value="sunset">Sunset</option>
+                  </select>
+                </label>
+              </div>
+              <div className="modal-actions">
+                <button type="button" className="ghost-btn" onClick={() => setNoteEditOpen(false)}>
+                  Cancel
+                </button>
+                <button type="submit" className="primary-btn">
+                  Save note
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
       {detailTask && (
         <div className="modal-backdrop" onClick={closeTask}>
           <div
@@ -1095,7 +1818,19 @@ export default function App() {
             onClick={(event) => event.stopPropagation()}
           >
             <div className="modal-header">
-              <h2>{detailTask.title}</h2>
+              <h2>
+                {detailEdit ? (
+                  <input
+                    className="detail-input title"
+                    value={detailDraft?.title || ""}
+                    onChange={(event) =>
+                      setDetailDraft((prev) => ({ ...prev, title: event.target.value }))
+                    }
+                  />
+                ) : (
+                  detailTask.title
+                )}
+              </h2>
               <div className="modal-header-actions">
                 <button
                   className="danger-btn"
@@ -1104,59 +1839,222 @@ export default function App() {
                 >
                   Delete
                 </button>
+                {detailEdit ? (
+                  <button className="primary-btn" onClick={saveTaskEdits} type="button">
+                    Save
+                  </button>
+                ) : (
+                  <button
+                    className="ghost-btn"
+                    onClick={() => setDetailEdit(true)}
+                    type="button"
+                  >
+                    Edit
+                  </button>
+                )}
+                <button
+                  className="ghost-btn"
+                  onClick={() => sendWhatsApp(detailTask.id)}
+                  type="button"
+                >
+                  Send WhatsApp
+                </button>
                 <button className="ghost-btn" onClick={closeTask} type="button">
                   Close
                 </button>
               </div>
             </div>
+            {notifyStatus.status !== "idle" && (
+              <div
+                className={classNames(
+                  "notify-status",
+                  notifyStatus.status === "error" && "error"
+                )}
+              >
+                {notifyStatus.status === "loading" ? "Sending..." : notifyStatus.message}
+              </div>
+            )}
             <div className="detail-grid">
-              <div className="detail-block">
+              <div className="detail-block summary">
                 <h3>Summary</h3>
-                <p>{detailTask.summary}</p>
+                {detailEdit ? (
+                  <textarea
+                    className="detail-input"
+                    value={detailDraft?.summary || ""}
+                    onChange={(event) =>
+                      setDetailDraft((prev) => ({ ...prev, summary: event.target.value }))
+                    }
+                  />
+                ) : (
+                  <p>{detailTask.summary}</p>
+                )}
               </div>
               <div className="detail-block">
                 <h3>Status</h3>
-                <p>
-                  {columns.find((col) => col.id === detailTask.status)?.label}
-                </p>
+                {detailEdit ? (
+                  <select
+                    className="detail-input"
+                    value={detailDraft?.status || detailTask.status}
+                    onChange={(event) =>
+                      setDetailDraft((prev) => ({ ...prev, status: event.target.value }))
+                    }
+                  >
+                    {columns.map((col) => (
+                      <option key={col.id} value={col.id}>
+                        {col.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <p>{columns.find((col) => col.id === detailTask.status)?.label}</p>
+                )}
               </div>
               <div className="detail-block">
                 <h3>Priority</h3>
-                <span
-                  className="badge"
-                  style={{ background: badgeColor(detailTask.priority) }}
-                >
-                  {detailTask.priority.toUpperCase()}
-                </span>
+                {detailEdit ? (
+                  <select
+                    className="detail-input"
+                    value={detailDraft?.priority || detailTask.priority}
+                    onChange={(event) =>
+                      setDetailDraft((prev) => ({
+                        ...prev,
+                        priority: event.target.value,
+                      }))
+                    }
+                  >
+                    {priorities.map((priority) => (
+                      <option key={priority.id} value={priority.id}>
+                        {priority.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span
+                    className="badge"
+                    style={{ background: badgeColor(detailTask.priority) }}
+                  >
+                    {detailTask.priority.toUpperCase()}
+                  </span>
+                )}
               </div>
               <div className="detail-block">
                 <h3>Project</h3>
-                <p className="mono">{detailTask.project}</p>
+                {detailEdit ? (
+                  <input
+                    className="detail-input"
+                    value={detailDraft?.project || ""}
+                    onChange={(event) =>
+                      setDetailDraft((prev) => ({ ...prev, project: event.target.value }))
+                    }
+                  />
+                ) : (
+                  <p className="mono">{detailTask.project}</p>
+                )}
               </div>
               <div className="detail-block">
                 <h3>Due</h3>
-                <p className="mono">{detailTask.due}</p>
+                {detailEdit ? (
+                  <input
+                    className="detail-input"
+                    type="date"
+                    value={detailDraft?.due || ""}
+                    onChange={(event) =>
+                      setDetailDraft((prev) => ({ ...prev, due: event.target.value }))
+                    }
+                  />
+                ) : (
+                  <p className="mono">{detailTask.due}</p>
+                )}
+              </div>
+              <div className="detail-block">
+                <h3>WhatsApp</h3>
+                {detailEdit ? (
+                  <div className="detail-whatsapp">
+                    <label className="repeat-toggle">
+                      <input
+                        type="checkbox"
+                        checked={!!detailDraft?.notify}
+                        onChange={(event) =>
+                          setDetailDraft((prev) => ({
+                            ...prev,
+                            notify: event.target.checked,
+                          }))
+                        }
+                      />
+                      Notify
+                    </label>
+                    <input
+                      className="detail-input"
+                      type="time"
+                      value={detailDraft?.reminder_time || ""}
+                      onChange={(event) =>
+                        setDetailDraft((prev) => ({
+                          ...prev,
+                          reminder_time: event.target.value,
+                        }))
+                      }
+                    />
+                  </div>
+                ) : (
+                  <p className="mono">
+                    {detailTask.notify ? (
+                      <>
+                        <span className="status-on">On</span> at{" "}
+                        {detailTask.reminder_time || "—"}
+                      </>
+                    ) : (
+                      "Off"
+                    )}
+                  </p>
+                )}
               </div>
               <div className="detail-block">
                 <h3>Assignee</h3>
                 <div className="detail-assignee">
-                  <span className="avatar">{detailTask.assignee}</span>
-                  <span className="mono">{detailTask.assignee}</span>
+                  <span className="avatar">
+                    {getInitials(detailTask.assignee)}
+                  </span>
+                  {!detailEdit && (
+                    <span className="mono">{detailTask.assignee}</span>
+                  )}
+                  {detailEdit && (
+                    <input
+                      className="detail-input small"
+                      value={detailDraft?.assignee || ""}
+                      onChange={(event) =>
+                        setDetailDraft((prev) => ({
+                          ...prev,
+                          assignee: event.target.value,
+                        }))
+                      }
+                    />
+                  )}
                 </div>
               </div>
               <div className="detail-block">
                 <h3>Tags</h3>
-                <div className="card-tags">
-                  {detailTask.tags.length ? (
-                    detailTask.tags.map((tag) => (
-                      <span key={tag} className="tag">
-                        {tag}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="tag">No tags</span>
-                  )}
-                </div>
+                {detailEdit ? (
+                  <input
+                    className="detail-input"
+                    value={detailDraft?.tags || ""}
+                    onChange={(event) =>
+                      setDetailDraft((prev) => ({ ...prev, tags: event.target.value }))
+                    }
+                    placeholder="Comma separated"
+                  />
+                ) : (
+                  <div className="card-tags">
+                    {detailTask.tags.length ? (
+                      detailTask.tags.map((tag) => (
+                        <span key={tag} className="tag">
+                          {tag}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="tag">No tags</span>
+                    )}
+                  </div>
+                )}
               </div>
               <div className="detail-block">
                 <h3>Progress</h3>
@@ -1168,8 +2066,100 @@ export default function App() {
                 </div>
               </div>
               <div className="detail-block">
+                <h3>Checklist</h3>
+                {detailTask.checklist && detailTask.checklist.length ? (
+                  <ul className="checklist">
+                    {detailTask.checklist.map((item, index) => (
+                      <li key={`${item.text}-${index}`}>
+                        <label className="check-item">
+                          <input
+                            type="checkbox"
+                            checked={item.done}
+                            onChange={() => toggleChecklistItem(detailTask.id, index)}
+                          />
+                          <span className={item.done ? "done" : ""}>{item.text}</span>
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p>No checklist</p>
+                )}
+                {detailEdit && (
+                  <p className="helper">
+                    Tip: add checklist items in Summary using * at the start of a line.
+                  </p>
+                )}
+              </div>
+              <div className="detail-block">
                 <h3>Repeat</h3>
-                {detailTask.repeat ? (
+                {detailEdit ? (
+                  <div className="detail-repeat">
+                    <label className="repeat-toggle">
+                      <input
+                        type="checkbox"
+                        checked={!!detailDraft?.repeatEnabled}
+                        onChange={(event) =>
+                          setDetailDraft((prev) => ({
+                            ...prev,
+                            repeatEnabled: event.target.checked,
+                          }))
+                        }
+                      />
+                      Repeat task
+                    </label>
+                    {detailDraft?.repeatEnabled && (
+                      <div className="detail-repeat-grid">
+                        <label>
+                          Every
+                          <input
+                            className="detail-input"
+                            type="number"
+                            min="1"
+                            value={detailDraft?.repeatInterval ?? 1}
+                            onChange={(event) =>
+                              setDetailDraft((prev) => ({
+                                ...prev,
+                                repeatInterval: event.target.value,
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          Unit
+                          <select
+                            className="detail-input"
+                            value={detailDraft?.repeatUnit || "weeks"}
+                            onChange={(event) =>
+                              setDetailDraft((prev) => ({
+                                ...prev,
+                                repeatUnit: event.target.value,
+                              }))
+                            }
+                          >
+                            <option value="days">Days</option>
+                            <option value="weeks">Weeks</option>
+                            <option value="months">Months</option>
+                          </select>
+                        </label>
+                        <label>
+                          End date
+                          <input
+                            className="detail-input"
+                            type="date"
+                            value={detailDraft?.repeatEndDate || ""}
+                            onChange={(event) =>
+                              setDetailDraft((prev) => ({
+                                ...prev,
+                                repeatEndDate: event.target.value,
+                              }))
+                            }
+                          />
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                ) : detailTask.repeat ? (
                   <p>
                     Every {detailTask.repeat.interval} {detailTask.repeat.unit}
                     {detailTask.repeat.endDate
@@ -1297,6 +2287,100 @@ function InsightCard({ label, value, trend }) {
         <h2>{value}</h2>
       </div>
       <span className="trend">{trend}</span>
+    </div>
+  );
+}
+
+function MonitorCharts({ range, series, tasks }) {
+  const { buckets, created, completed, overdue } = series;
+  const maxValue = Math.max(1, ...created, ...completed, ...overdue);
+
+  function makePath(values) {
+    const width = 900;
+    const height = 120;
+    const step = width / Math.max(1, values.length - 1);
+    return values
+      .map((value, index) => {
+        const x = index * step;
+        const y = height - (value / maxValue) * height;
+        return `${index === 0 ? "M" : "L"} ${x} ${y}`;
+      })
+      .join(" ");
+  }
+
+  const statusCounts = tasks.reduce(
+    (acc, task) => {
+      acc[task.status] = (acc[task.status] || 0) + 1;
+      return acc;
+    },
+    {}
+  );
+  const priorityCounts = tasks.reduce(
+    (acc, task) => {
+      acc[task.priority] = (acc[task.priority] || 0) + 1;
+      return acc;
+    },
+    {}
+  );
+
+  return (
+    <div className="monitor-charts">
+      <div className="monitor-card-lg">
+        <h3>Created vs Completed</h3>
+        <svg viewBox="0 0 900 120" preserveAspectRatio="none">
+          <path d={makePath(created)} className="line created" />
+          <path d={makePath(completed)} className="line completed" />
+        </svg>
+        <div className="monitor-legend">
+          <span className="dot created" /> Created
+          <span className="dot completed" /> Completed
+        </div>
+      </div>
+      <div className="monitor-card-lg">
+        <h3>Overdue</h3>
+        <svg viewBox="0 0 900 120" preserveAspectRatio="none">
+          <path d={makePath(overdue)} className="line overdue" />
+        </svg>
+        <div className="monitor-legend">
+          <span className="dot overdue" /> Overdue
+        </div>
+      </div>
+      <div className="monitor-card-lg">
+        <h3>Status breakdown</h3>
+        <div className="bar-list">
+          {["backlog", "in_progress", "review", "done"].map((status) => (
+            <div key={status} className="bar-row">
+              <span>{status.replace("_", " ")}</span>
+              <div className="bar">
+                <div
+                  style={{
+                    width: `${((statusCounts[status] || 0) / Math.max(1, tasks.length)) * 100}%`,
+                  }}
+                />
+              </div>
+              <strong>{statusCounts[status] || 0}</strong>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="monitor-card-lg">
+        <h3>Priority breakdown</h3>
+        <div className="bar-list">
+          {["critical", "high", "medium", "low"].map((priority) => (
+            <div key={priority} className="bar-row">
+              <span>{priority}</span>
+              <div className="bar">
+                <div
+                  style={{
+                    width: `${((priorityCounts[priority] || 0) / Math.max(1, tasks.length)) * 100}%`,
+                  }}
+                />
+              </div>
+              <strong>{priorityCounts[priority] || 0}</strong>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
